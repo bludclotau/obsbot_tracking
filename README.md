@@ -45,7 +45,7 @@ The app writes 1080p30 into the loopback device. OBS must not open the real Tiny
 
 ```bash
 obsbot-tiny3 status
-obsbot-tiny3 track on          # object tracking locked on belly / hips
+obsbot-tiny3 track on          # full-body person tracking
 obsbot-tiny3 track off
 obsbot-tiny3 zoom 0            # 1.0x  (100 = 4.0x)
 obsbot-tiny3 home
@@ -53,13 +53,13 @@ obsbot-tiny3 nudge left
 obsbot-tiny3 ui                # preview + virtual camera
 ```
 
-`track on` / `track waist` turns on Tiny 3 Lite **object tracking** (AI mode 7,2) and auto-selects the **belly / hips** as the tracked object (tap at mid-frame, slightly below center, plus a hips bounding box). The gimbal is left to that tracker. A previous hold-loop that tilted down against face/upper-body tracking is gone — that fight was the pause, dip, and snap-back.
+`track on` / `track human` enables **full-body person tracking**. The virtual camera is an uncropped 1080p feed for OBS; crop there if you want a tighter shot. If single-person human mode (2,0) is rejected, the controller uses group tracking (1,0), which still follows a person.
 
 ## Zoom
 
 Tiny 3 Lite ignores UVC `zoom_absolute`. Zoom is a framed XU command, **1.0x–4.0x**.
 
-While AI tracking is on, the camera owns sensor zoom (so the waist shot stays composed). The UI zoom slider then crops the **virtual camera and preview** instead, so zoom still changes what OBS sees.
+While AI tracking is on, the camera owns sensor zoom. Leave the slider at 1.0x and crop in OBS. The slider still crops the virtual camera and preview if you need it.
 
 ## How tracking works
 
@@ -89,8 +89,6 @@ AI command: `[0x16, 0x02, mode, submode]`.
 | 4, 0 | whiteboard |
 | 5, 0 | desk |
 | 7, 2 | object (Tiny 3 Lite AI Tracking 2.0) |
-
-Waist mode sends the object-tracking select-target packets (click / box / biggest / center) at the bellybutton. Tiny 3 Lite often does not ACK those frames; they are still the SDK tap-to-track commands.
 
 Zoom frame: command `0x1942`, payload `[speed u32][ratio×100 u32]` with ratio 100–400.
 

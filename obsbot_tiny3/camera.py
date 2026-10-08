@@ -26,13 +26,9 @@ RX_AI = 0x04
 # Tilt helpers for the PTZ pad. Positive pitch is down.
 MAX_PITCH_DOWN_DEG = 40.0
 
-# Normalized frame coords: x right, y down. Belly / hips of a person
-# standing in a cowboy shot sit around the lower-center of the frame.
-HIPS_X = 0.50
-HIPS_Y = 0.62
-HIPS_BOX = (0.38, 0.50, 0.62, 0.80)
-
-WAIST_MODES = frozenset({"on", "waist", "thigh", "medium", "object"})
+# CLI/UI aliases that mean "follow a person, full body".
+FULL_BODY_MODES = frozenset({"on", "waist", "thigh", "medium", "human", "normal"})
+WAIST_MODES = FULL_BODY_MODES  # old name, kept for imports
 
 AI_MODES = {
     "off": (0, 0),
@@ -43,10 +39,10 @@ AI_MODES = {
     "normal": (2, 0),
     "upper": (2, 1),
     "upperbody": (2, 1),
-    "on": (7, 2),
-    "waist": (7, 2),
-    "thigh": (7, 2),
-    "medium": (7, 2),
+    "on": (2, 0),
+    "waist": (2, 0),
+    "thigh": (2, 0),
+    "medium": (2, 0),
     "object": (7, 2),
     "closeup": (2, 2),
     "headless": (2, 3),
@@ -125,11 +121,6 @@ def crc16_usb(data: bytes) -> int:
     return crc ^ 0xFFFF
 
 
-def pack_v3_cmd(cmd_id: int, cmd_set: int) -> int:
-    """V3 wire command: cmd_set in low 6 bits, cmd_id in the high 10."""
-    return (cmd_set & 0x3F) | ((cmd_id & 0x3FF) << 6)
-
-
 def build_frame(
     flags: int,
     seq: int,
@@ -186,17 +177,20 @@ class Camera:
         m, n = AI_MODES[key]
         if key not in {"off", "stop", "none"}:
             self.wake()
+            if self.status().ai == "object":
+                self.dev.send_status_cmd(bytes([xu.TAG_AI_MODE, 0x02, 0, 0]))
+                time.sleep(0.35)
         self.dev.send_status_cmd(bytes([xu.TAG_AI_MODE, 0x02, m, n]))
-        time.sleep(0.4)
+        time.sleep(0.45)
         st = self.status()
         if st.ai.startswith("unknown") and (m, n) not in AI_NAMES:
             time.sleep(0.4)
             st = self.status()
-        # Tiny 3 Lite object-tracking 2.0 can reject legacy human (2,x).
-        # Group still follows people, so Full body keeps tracking.
-        if key in {"human", "normal", "upper", "upperbody"} and st.ai in {"off", "none", "stop"}:
+        # Tiny 3 Lite often rejects single-person human (2,x) after object
+        # mode has been used. Group tracking still follows a person.
+        if key in FULL_BODY_MODES | {"upper", "upperbody"} and st.ai in {"off", "none", "stop"}:
             self.dev.send_status_cmd(bytes([xu.TAG_AI_MODE, 0x02, 1, 0]))
-            time.sleep(0.4)
+            time.sleep(0.45)
             st = self.status()
         return st
 
@@ -278,43 +272,6 @@ class Camera:
         self.gimbal_stop()
         return self.gimbal_pitch_deg()
 
-    def _try_frame(self, cmd: int, receiver: int, payload: bytes, sender: int = 0x0B) -> None:
-        try:
-            self.send_frame(FLAGS_SET, cmd, receiver, payload, sender=sender)
-        except OSError:
-            pass
-
-    def select_hips(self) -> None:
-        """Ask the on-camera tracker to lock the belly / hips.
-
-        Tiny 3 Lite object tracking (AI 7,2) follows a tapped or boxed
-        object. Center auto-selects that region as the target: a click at
-        the bellybutton and a box around the hips. Several SDK encodings
-        are sent because this model does not ACK the select mailbox.
-        """
-        pos = struct.pack("<ff", HIPS_X, HIPS_Y)
-        box = struct.pack("<ffff", *HIPS_BOX)
-        click = struct.pack("<hhhhff", 2, 0, 0, 5, HIPS_X, HIPS_Y) + bytes(8)
-        roi = struct.pack("<hhhhffff", 3, 2, 0, 0, *HIPS_BOX)
-        try:
-            self.dev.send_status_cmd(bytes([xu.TAG_AI_MODE, 0x12, 7, 2]) + box)
-        except OSError:
-            pass
-        # SDK select-by-pos/box/biggest/unified-target. Tiny 3 Lite often
-        # does not ACK these; send both cmd-set 3 (gimbal) and 4 (AI).
-        shots = (
-            (0x63, 3, 0x03, pos),
-            (0x63, 4, 0x04, pos + bytes([0])),
-            (0x64, 3, 0x03, box),
-            (0x64, 4, 0x04, box),
-            (0x65, 3, 0x03, bytes([0])),
-            (0x66, 3, 0x03, b""),
-            (0x7A, 3, 0x03, click),
-            (0x7A, 3, 0x03, roi),
-        )
-        for cmd_id, cmd_set, rx, payload in shots:
-            self._try_frame(pack_v3_cmd(cmd_id, cmd_set), rx, payload)
-
     def wake(self) -> None:
         """Leave auto-sleep / privacy pose so tracking commands are accepted."""
         try:
@@ -328,12 +285,12 @@ class Camera:
                 time.sleep(0.25)
                 return
 
+    def apply_full_body(self) -> Status:
+        """Person tracking, full body. Leaves framing to the camera; crop in OBS."""
+        return self.set_ai("human")
+
     def apply_subject_framing(self) -> Status:
-        """Object tracking locked on the belly / hips. No gimbal hold loop."""
-        self.set_ai("object")
-        time.sleep(0.25)
-        self.select_hips()
-        return self.status()
+        return self.apply_full_body()
 
     def recenter(self) -> None:
         self.gimbal_stop()

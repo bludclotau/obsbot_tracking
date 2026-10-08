@@ -6,7 +6,7 @@ import json
 import sys
 import webbrowser
 
-from .camera import AI_MODES, WAIST_MODES, Camera
+from .camera import AI_MODES, FULL_BODY_MODES, Camera
 from .web import PreviewServer
 from .xu import find_loopback_device
 
@@ -38,8 +38,8 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(cam.status(with_serial=True).as_dict(), indent=2))
             return 0
         if args.cmd == "track":
-            if args.mode in WAIST_MODES:
-                st = cam.apply_subject_framing()
+            if args.mode in FULL_BODY_MODES:
+                st = cam.apply_full_body()
             else:
                 st = cam.set_ai(args.mode)
             print(json.dumps(st.as_dict(), indent=2))

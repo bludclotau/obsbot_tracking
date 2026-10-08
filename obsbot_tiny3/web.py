@@ -10,7 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from .camera import AI_MODES, WAIST_MODES, Camera
+from .camera import AI_MODES, FULL_BODY_MODES, Camera
 from .xu import find_loopback_device
 
 HTML = """<!DOCTYPE html>
@@ -49,7 +49,7 @@ HTML = """<!DOCTYPE html>
     <h1>AI tracking</h1>
     <div class="status" id="status">loading…</div>
     <div class="grid" id="modes"></div>
-    <p class="hint">Waist mode: on-camera object tracking auto-locked on the belly / hips. The gimbal is left to the tracker so it cannot snap back to upper-body / face.</p>
+    <p class="hint">Full body: on-camera person tracking. OBS gets an uncropped 1080p virtual camera — crop there if you want a tighter shot.</p>
     <label class="zoom">Zoom <span id="zlab">1.0x</span></label>
     <input id="zoom" type="range" min="0" max="100" value="0" step="1">
     <h1 style="margin-top:20px">PTZ</h1>
@@ -69,7 +69,6 @@ HTML = """<!DOCTYPE html>
 <script>
 const modes = [
   ["off","Off"],
-  ["waist","Waist"],
   ["human","Full body"],
   ["upper","Upper"],
   ["closeup","Close-up"],
@@ -103,15 +102,15 @@ async function refresh() {
   const vcam = s.virtual_camera ? ("\\nOBS  " + s.virtual_camera) : "\\nOBS  virtual camera missing";
   document.getElementById("status").textContent =
     (s.serial ? s.serial+" · " : "") + s.device +
-    "\\nAI " + s.ai + " · " + (s.framing || "custom") +
+    "\\nAI " + s.ai +
     " · zoom " + (s.zoom_x || "1.0") + "x" +
     (s.running ? " · run" : " · sleep") + vcam;
   document.querySelectorAll("#modes button").forEach(b => {
-    const waist = s.framing === "waist";
-    b.classList.toggle("active",
-      (b.dataset.mode === "waist" && waist) ||
-      (b.dataset.mode === s.ai && !(waist && b.dataset.mode === "human"))
-    );
+    const full = s.framing === "full-body";
+    let on = b.dataset.mode === s.ai;
+    if (b.dataset.mode === "human") on = full || s.ai === "human";
+    else if (b.dataset.mode === "group") on = s.ai === "group" && !full;
+    b.classList.toggle("active", on);
   });
   if (typeof s.zoom_pct === "number" && document.activeElement !== zoom) {
     zoom.value = s.zoom_pct;
@@ -142,7 +141,7 @@ class PreviewServer:
         self._clients: list = []
         self._lock = threading.Lock()
         self._zoom_pct = 0
-        self._waist_mode = False
+        self._full_body = False
         self._pump_stop = threading.Event()
         self._ffmpeg_log = open("/tmp/obsbot-tiny3-ffmpeg.log", "ab")
         handler = self._handler()
@@ -155,7 +154,7 @@ class PreviewServer:
         st["virtual_camera"] = str(self.loopback) if self.loopback else None
         pitch = self.camera.gimbal_pitch_deg()
         st["pitch_deg"] = round(pitch, 1) if pitch is not None else None
-        st["framing"] = "waist" if self._waist_mode else st["ai"]
+        st["framing"] = "full-body" if self._full_body else st["ai"]
         return st
 
     def _ffmpeg_zoom(self) -> float:
@@ -174,22 +173,24 @@ class PreviewServer:
             parts.append(f"format={pix_fmt}")
         return ",".join(parts)
 
-    def _set_waist_mode(self, on: bool) -> None:
-        was = self._waist_mode
-        self._waist_mode = on
+    def _set_full_body(self, on: bool) -> None:
+        was = self._full_body
+        self._full_body = on
         if on and not was:
-            threading.Thread(target=self._hips_select_burst, daemon=True).start()
+            threading.Thread(target=self._keep_tracking, daemon=True).start()
 
-    def _hips_select_burst(self) -> None:
-        """Re-tap the belly / hips a few times while the tracker acquires."""
-        for _ in range(3):
-            if not self._waist_mode:
+    def _keep_tracking(self) -> None:
+        """Re-enable person tracking if the camera drops to off."""
+        while self._full_body:
+            time.sleep(4.0)
+            if not self._full_body:
                 return
             try:
-                self.camera.select_hips()
+                st = self.camera.status()
+                if st.ai in {"off", "none", "stop"}:
+                    self.camera.apply_full_body()
             except OSError:
                 pass
-            time.sleep(0.45)
 
     def _build_ffmpeg_cmd(self) -> list[str]:
         cmd = [
@@ -337,15 +338,15 @@ class PreviewServer:
                 parsed = urlparse(self.path)
                 qs = parse_qs(parsed.query)
                 if parsed.path == "/api/track":
-                    mode = (qs.get("mode") or ["waist"])[0]
+                    mode = (qs.get("mode") or ["human"])[0]
                     if mode not in AI_MODES:
                         self.send_error(400, "bad mode")
                         return
-                    if mode in WAIST_MODES:
-                        server.camera.apply_subject_framing()
-                        server._set_waist_mode(True)
+                    if mode in FULL_BODY_MODES:
+                        server.camera.apply_full_body()
+                        server._set_full_body(True)
                     else:
-                        server._set_waist_mode(False)
+                        server._set_full_body(False)
                         server.camera.set_ai(mode)
                     server._restart_ffmpeg()
                     self._json(server.public_status())
@@ -380,8 +381,8 @@ class PreviewServer:
         return Handler
 
     def serve(self) -> None:
-        self.camera.apply_subject_framing()
-        self._set_waist_mode(True)
+        self.camera.apply_full_body()
+        self._set_full_body(True)
         self._start_ffmpeg()
         print(f"Tiny 3 Lite UI     http://{self.host}:{self.port}/")
         print(f"capture node       {self.camera.path}")
@@ -389,13 +390,13 @@ class PreviewServer:
             print(f"OBS virtual camera {self.loopback}  (Video Capture Device)")
         else:
             print("OBS virtual camera  not found — load v4l2loopback")
-        print("tracking           object, auto-locked on belly / hips")
+        print("tracking           full body person tracking")
         try:
             self.httpd.serve_forever()
         finally:
             self.close()
 
     def close(self) -> None:
-        self._set_waist_mode(False)
+        self._set_full_body(False)
         self._stop_ffmpeg()
         self.httpd.server_close()
