@@ -2,23 +2,26 @@
 
 Linux controller for the **OBSBOT Tiny 3 Lite** (PW105, USB `3564:ff04`).
 
-Live MJPEG preview, on-camera AI tracking, and UVC pan/tilt/zoom. No vendor SDK.
+Live preview, OBS virtual camera, on-camera AI tracking, and digital zoom. No vendor SDK.
 
 The official OBSBOT Linux SDK does not list Tiny 3 Lite. This project talks to the camera over the same UVC extension unit the Tiny 2 family uses.
 
 ## Requirements
 
 - Linux, Python 3.11+
-- `ffmpeg` (preview)
+- `ffmpeg` (preview and virtual camera)
 - `v4l2-ctl` (PTZ)
-- User in group `video` (and a udev rule so `/dev/videoN` is writable)
+- `v4l2loopback` (OBS virtual camera)
+- User in group `video`
 
 Fedora:
 
 ```bash
-sudo dnf install ffmpeg v4l-utils
+sudo dnf install ffmpeg v4l-utils v4l2loopback
 sudo usermod -aG video "$USER"
 ```
+
+This host already has `/dev/video42` labeled **OBSBOT Virtual Camera**.
 
 ## Install
 
@@ -28,30 +31,35 @@ cd obsbot_tracking
 pip install --user -e .
 ```
 
-That installs the `obsbot-tiny3` command. You can also run without installing:
+Override the capture node with `-d /dev/video1` or `OBSBOT_DEVICE=/dev/video1`. Override the loopback node with `--virtual-camera /dev/video42` or `OBSBOT_VIRTUAL`.
 
-```bash
-python3 -m obsbot_tiny3 status
-```
+## OBS Studio
 
-Override the capture node with `-d /dev/video1` or `OBSBOT_DEVICE=/dev/video1`.
+1. Stop anything else holding the real camera (lan-share, another preview).
+2. Run `obsbot-tiny3 ui`.
+3. In OBS, add **Video Capture Device** → **OBSBOT Virtual Camera** (`/dev/video42`). Use 1920×1080.
+
+The app writes 1080p30 into the loopback device. OBS must not open the real Tiny 3 Lite node; that would steal the camera from tracking.
 
 ## Usage
 
 ```bash
 obsbot-tiny3 status
-obsbot-tiny3 track human
+obsbot-tiny3 track on          # waist shot: thighs to eyebrows
 obsbot-tiny3 track off
+obsbot-tiny3 zoom 0            # 1.0x  (100 = 4.0x)
 obsbot-tiny3 home
 obsbot-tiny3 nudge left
-obsbot-tiny3 ui            # http://127.0.0.1:8765/
+obsbot-tiny3 ui                # preview + virtual camera
 ```
 
-AI modes: `off`, `human`, `upper`, `closeup`, `headless`, `lower`, `group`, `hand`, `desk`, `whiteboard`.
+`track on` / `track waist` / `track upper` lock the gimbal to **upper-body tracking**: knees/thigh at the bottom of the frame, eyebrows at the top, waist and face visible. Close-up and full-body modes remain available if you ask for them.
 
-The UI binds to localhost. ffmpeg copies MJPEG from the capture node; XU ioctls share that same node, so tracking still works while the preview is open.
+## Zoom
 
-The camera is exclusive. Stop anything else holding `/dev/videoN` (OBS, lan-share, another preview) first.
+Tiny 3 Lite ignores UVC `zoom_absolute`. Zoom is a framed XU command, **1.0x–4.0x**.
+
+While AI tracking is on, the camera owns sensor zoom (so the waist shot stays composed). The UI zoom slider then crops the **virtual camera and preview** instead, so zoom still changes what OBS sees.
 
 ## How tracking works
 
@@ -62,7 +70,7 @@ Tiny 3 Lite exposes the Tiny 2 vendor XU:
 | GUID | `{9a1e7291-6843-4683-6d92-39bc7906ee49}` |
 | Unit | 2 |
 | Selector 6 | 60-byte AI / image status and command block |
-| Selector 2 | checksummed V3 mailbox (serial, gimbal frames) |
+| Selector 2 | checksummed V3 mailbox (serial, gimbal, zoom frames) |
 
 Selector-6 writes must overlay the command on the **current** status block. Zero-padded 60-byte writes are ignored.
 
@@ -72,8 +80,8 @@ AI command: `[0x16, 0x02, mode, submode]`.
 |---|---|
 | 0, 0 | off |
 | 1, 0 | group |
-| 2, 0 | human (normal) |
-| 2, 1 | upper body |
+| 2, 0 | human (full body) |
+| 2, 1 | upper body (thigh to eyebrows) |
 | 2, 2 | close-up |
 | 2, 3 | headless |
 | 2, 4 | lower body |
@@ -81,7 +89,7 @@ AI command: `[0x16, 0x02, mode, submode]`.
 | 4, 0 | whiteboard |
 | 5, 0 | desk |
 
-Pan/tilt/zoom use standard UVC controls (`pan_absolute`, `tilt_absolute`, `pan_speed`, `tilt_speed`, `zoom_absolute`).
+Zoom frame: command `0x1942`, payload `[speed u32][ratio×100 u32]` with ratio 100–400.
 
 ## Credits
 

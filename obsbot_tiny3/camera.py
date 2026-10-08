@@ -11,6 +11,14 @@ from pathlib import Path
 from . import xu
 from .xu import XuDevice
 
+# Tiny 3 Lite digital zoom is 1.0x–4.0x. Framed ratio is x100 (100–400).
+# UVC zoom_absolute is a dummy on this camera and is ignored.
+ZOOM_RATIO_MIN = 100
+ZOOM_RATIO_MAX = 400
+FLAGS_SET = 0x25
+CMD_ZOOM_ABS = 0x1942
+RX_CAMERA = 0x02
+
 AI_MODES = {
     "off": (0, 0),
     "stop": (0, 0),
@@ -20,6 +28,10 @@ AI_MODES = {
     "normal": (2, 0),
     "upper": (2, 1),
     "upperbody": (2, 1),
+    "on": (2, 1),
+    "waist": (2, 1),
+    "thigh": (2, 1),
+    "medium": (2, 1),
     "closeup": (2, 2),
     "headless": (2, 3),
     "lower": (2, 4),
@@ -141,8 +153,12 @@ class Camera:
             raise ValueError(f"unknown AI mode {mode!r}; choose from {sorted(set(AI_MODES))}")
         m, n = AI_MODES[key]
         self.dev.send_status_cmd(bytes([xu.TAG_AI_MODE, 0x02, m, n]))
-        time.sleep(0.25)
-        return self.status()
+        time.sleep(0.4)
+        st = self.status()
+        if st.ai.startswith("unknown"):
+            time.sleep(0.4)
+            st = self.status()
+        return st
 
     def set_hdr(self, on: bool) -> None:
         self.dev.send_status_cmd(bytes([xu.TAG_HDR, 0x01, 1 if on else 0]))
@@ -185,9 +201,38 @@ class Camera:
         time.sleep(ms / 1000)
         self._v4l("pan_speed=0,tilt_speed=0")
 
-    def set_zoom(self, percent: int) -> None:
-        percent = max(0, min(100, percent))
-        self._v4l(f"zoom_absolute={percent}")
+    def set_zoom(self, percent: int, speed: int = 8) -> Status:
+        """Set digital zoom. 0 = 1.0x, 100 = 4.0x. Ignored while AI tracking is on."""
+        percent = max(0, min(100, int(percent)))
+        span = ZOOM_RATIO_MAX - ZOOM_RATIO_MIN
+        ratio = ZOOM_RATIO_MIN + round(percent * span / 100)
+        return self.set_zoom_ratio(ratio, speed)
+
+    def set_zoom_ratio(self, ratio_x100: int, speed: int = 8) -> Status:
+        ratio = max(ZOOM_RATIO_MIN, min(ZOOM_RATIO_MAX, int(ratio_x100)))
+        speed = max(1, min(10, int(speed)))
+        target_pct = round((ratio - ZOOM_RATIO_MIN) * 100 / (ZOOM_RATIO_MAX - ZOOM_RATIO_MIN))
+        self.send_frame(FLAGS_SET, CMD_ZOOM_ABS, RX_CAMERA, struct.pack("<II", speed, ratio))
+        for _ in range(16):
+            time.sleep(0.2)
+            st = self.status()
+            if st.ai not in {"off", "none", "stop"}:
+                return st
+            if abs(st.zoom_pct - target_pct) <= 3:
+                return st
+        return self.status()
+
+    def apply_subject_framing(self) -> Status:
+        """Lock on-camera AI to a thigh-to-eyebrow shot (waist and face in frame)."""
+        st = self.status()
+        if st.ai != "off" or st.zoom_pct > 2 or st.fov != 0:
+            self.set_ai("off")
+            self.set_zoom_ratio(ZOOM_RATIO_MIN, speed=10)
+            self.set_fov(0)
+            time.sleep(0.2)
+        self.set_ai("upper")
+        self.set_fov(0)
+        return self.status()
 
     def _v4l(self, ctrls: str) -> None:
         subprocess.run(

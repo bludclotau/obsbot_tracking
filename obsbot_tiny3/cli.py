@@ -8,6 +8,7 @@ import webbrowser
 
 from .camera import AI_MODES, Camera
 from .web import PreviewServer
+from .xu import find_loopback_device
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -18,12 +19,16 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("status", help="print AI / HDR / FOV / serial")
     tr = sub.add_parser("track", help="set on-camera AI tracking mode")
     tr.add_argument("mode", choices=sorted(set(AI_MODES)))
+    zm = sub.add_parser("zoom", help="digital zoom 0=1.0x … 100=4.0x")
+    zm.add_argument("percent", type=int)
     sub.add_parser("home", help="recenter gimbal")
     pt = sub.add_parser("nudge", help="jog pan/tilt")
     pt.add_argument("dir", choices=["left", "right", "up", "down"])
-    ui = sub.add_parser("ui", help="open live preview + tracking UI")
+    ui = sub.add_parser("ui", help="preview + OBS virtual camera + tracking")
     ui.add_argument("--port", type=int, default=8765)
     ui.add_argument("--no-browser", action="store_true")
+    ui.add_argument("--virtual-camera", help="v4l2loopback node (default: autodetect)")
+    ui.add_argument("--no-virtual-camera", action="store_true")
 
     args = p.parse_args(argv)
     cam = Camera(args.device)
@@ -33,7 +38,14 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(cam.status(with_serial=True).as_dict(), indent=2))
             return 0
         if args.cmd == "track":
-            st = cam.set_ai(args.mode)
+            if args.mode in {"on", "upper", "upperbody", "waist", "thigh", "medium"}:
+                st = cam.apply_subject_framing()
+            else:
+                st = cam.set_ai(args.mode)
+            print(json.dumps(st.as_dict(), indent=2))
+            return 0
+        if args.cmd == "zoom":
+            st = cam.set_zoom(args.percent)
             print(json.dumps(st.as_dict(), indent=2))
             return 0
         if args.cmd == "home":
@@ -52,10 +64,11 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(cam.status().as_dict(), indent=2))
             return 0
         if args.cmd == "ui":
+            loopback = None if args.no_virtual_camera else (args.virtual_camera or find_loopback_device())
             url = f"http://127.0.0.1:{args.port}/"
             if not args.no_browser:
                 webbrowser.open(url)
-            PreviewServer(cam, port=args.port).serve()
+            PreviewServer(cam, port=args.port, loopback=loopback).serve()
             return 0
     except (OSError, ValueError, FileNotFoundError) as e:
         print(e, file=sys.stderr)

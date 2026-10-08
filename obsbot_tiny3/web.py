@@ -1,4 +1,4 @@
-"""Local preview + control UI. ffmpeg reads V4L2; XU ioctls share the node."""
+"""Local preview + OBS virtual camera. ffmpeg reads V4L2; XU ioctls share the node."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .camera import AI_MODES, Camera
+from .xu import find_loopback_device
 
 HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -25,13 +26,16 @@ HTML = """<!DOCTYPE html>
   .panel { background:rgba(23,23,26,.75); border:1px solid rgba(255,255,255,.08); border-radius:16px; padding:16px; }
   img#preview { width:100%; height:auto; background:#000; border-radius:12px; display:block; }
   h1 { font-size:16px; margin:0 0 12px; font-weight:600; }
-  .status { font-size:12px; color:#a1a1aa; margin-bottom:12px; }
+  .status { font-size:12px; color:#a1a1aa; margin-bottom:12px; line-height:1.45; white-space:pre-wrap; }
   .grid { display:grid; grid-template-columns: 1fr 1fr; gap:8px; }
   button { background:#27272a; color:#f4f4f5; border:1px solid #3f3f46; border-radius:8px; padding:10px 8px; cursor:pointer; font-size:13px; }
   button:hover { background:#3f3f46; }
   button.active { background:#2563eb; border-color:#3b82f6; }
   .row { display:flex; gap:8px; margin-top:8px; }
   .row button { flex:1; }
+  label.zoom { display:flex; justify-content:space-between; font-size:13px; margin-top:16px; }
+  input[type=range] { width:100%; margin-top:8px; }
+  .hint { font-size:11px; color:#71717a; margin-top:8px; }
 </style>
 </head>
 <body>
@@ -44,6 +48,9 @@ HTML = """<!DOCTYPE html>
     <h1>AI tracking</h1>
     <div class="status" id="status">loading…</div>
     <div class="grid" id="modes"></div>
+    <p class="hint">Track (waist) keeps knees/thigh to eyebrows so waist and face stay in frame. OBS uses the virtual camera.</p>
+    <label class="zoom">Zoom <span id="zlab">1.0x</span></label>
+    <input id="zoom" type="range" min="0" max="100" value="0" step="1">
     <h1 style="margin-top:20px">PTZ</h1>
     <div class="row">
       <button data-ptz="up">Tilt up</button>
@@ -59,25 +66,51 @@ HTML = """<!DOCTYPE html>
   </aside>
 </main>
 <script>
-const modes = ["off","human","upper","closeup","group","hand","desk","whiteboard"];
+const modes = [
+  ["off","Off"],
+  ["upper","Waist"],
+  ["human","Full body"],
+  ["closeup","Close-up"],
+  ["group","Group"],
+  ["hand","Hand"],
+  ["desk","Desk"],
+  ["whiteboard","Board"]
+];
 const box = document.getElementById("modes");
-modes.forEach(m => {
+modes.forEach(([id, label]) => {
   const b = document.createElement("button");
-  b.textContent = m;
-  b.dataset.mode = m;
-  b.onclick = () => fetch("/api/track?mode="+m, {method:"POST"}).then(refresh);
+  b.textContent = label;
+  b.dataset.mode = id;
+  b.onclick = () => fetch("/api/track?mode="+id, {method:"POST"}).then(refresh);
   box.appendChild(b);
 });
 document.querySelectorAll("[data-ptz]").forEach(b => {
   b.onclick = () => fetch("/api/ptz?dir="+b.dataset.ptz, {method:"POST"}).then(refresh);
 });
+const zoom = document.getElementById("zoom");
+function zoomLabel(pct) { return (1 + 3 * pct / 100).toFixed(1) + "x"; }
+zoom.oninput = () => { document.getElementById("zlab").textContent = zoomLabel(+zoom.value); };
+zoom.onchange = () => {
+  fetch("/api/zoom?pct="+zoom.value, {method:"POST"}).then(() => {
+    document.getElementById("preview").src = "/stream.mjpg?t="+Date.now();
+    refresh();
+  });
+};
 async function refresh() {
   const s = await (await fetch("/api/status")).json();
+  const vcam = s.virtual_camera ? ("\\nOBS  " + s.virtual_camera) : "\\nOBS  virtual camera missing";
   document.getElementById("status").textContent =
-    (s.serial ? s.serial+" · " : "") + s.device + " · AI " + s.ai + (s.running ? " · run" : " · sleep");
+    (s.serial ? s.serial+" · " : "") + s.device +
+    "\\nAI " + s.ai + " · " + (s.framing || "custom") +
+    " · zoom " + (s.zoom_x || "1.0") + "x" +
+    (s.running ? " · run" : " · sleep") + vcam;
   document.querySelectorAll("#modes button").forEach(b => {
-    b.classList.toggle("active", b.dataset.mode === s.ai || (s.ai==="human" && b.dataset.mode==="normal"));
+    b.classList.toggle("active", b.dataset.mode === s.ai || (s.ai==="upper" && b.dataset.mode==="upper"));
   });
+  if (typeof s.zoom_pct === "number" && document.activeElement !== zoom) {
+    zoom.value = s.zoom_pct;
+    document.getElementById("zlab").textContent = zoomLabel(s.zoom_pct);
+  }
 }
 refresh();
 setInterval(refresh, 2000);
@@ -88,38 +121,109 @@ setInterval(refresh, 2000);
 
 
 class PreviewServer:
-    def __init__(self, camera: Camera, host: str = "127.0.0.1", port: int = 8765):
+    def __init__(
+        self,
+        camera: Camera,
+        host: str = "127.0.0.1",
+        port: int = 8765,
+        loopback: Path | str | None = None,
+    ):
         self.camera = camera
         self.host = host
         self.port = port
+        self.loopback = Path(loopback) if loopback else find_loopback_device()
         self._ffmpeg: subprocess.Popen | None = None
         self._clients: list = []
         self._lock = threading.Lock()
+        self._zoom_pct = 0
+        self._pump_stop = threading.Event()
+        self._ffmpeg_log = open("/tmp/obsbot-tiny3-ffmpeg.log", "ab")
         handler = self._handler()
         self.httpd = ThreadingHTTPServer((host, port), handler)
+
+    def public_status(self) -> dict:
+        st = self.camera.status(with_serial=True).as_dict()
+        st["zoom_pct"] = self._zoom_pct
+        st["zoom_x"] = round(1 + 3 * self._zoom_pct / 100, 2)
+        st["virtual_camera"] = str(self.loopback) if self.loopback else None
+        st["framing"] = "thigh-to-eyebrow" if st["ai"] == "upper" else st["ai"]
+        return st
+
+    def _ffmpeg_zoom(self) -> float:
+        # Tracking owns sensor zoom; crop the OBS/preview feed instead.
+        if self.camera.status().ai in {"off", "none", "stop"}:
+            return 1.0
+        return 1.0 + 3.0 * (self._zoom_pct / 100.0)
+
+    def _build_ffmpeg_cmd(self) -> list[str]:
+        z = self._ffmpeg_zoom()
+        crop = f"crop=iw/{z:.4f}:ih/{z:.4f}," if z > 1.02 else ""
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
+            "-fflags", "nobuffer", "-flags", "low_delay",
+            "-f", "v4l2", "-input_format", "mjpeg",
+            "-video_size", "1920x1080", "-framerate", "30",
+            "-i", str(self.camera.path),
+        ]
+        if self.loopback:
+            cmd += [
+                "-filter_complex",
+                f"[0:v]split=2[v1][v2];"
+                f"[v1]{crop}scale=1920:1080,format=yuv420p[obs];"
+                f"[v2]{crop}scale=1280:720[web]",
+                "-map", "[obs]", "-f", "v4l2", "-pix_fmt", "yuv420p", str(self.loopback),
+                "-map", "[web]", "-c:v", "mjpeg", "-q:v", "5", "-f", "mjpeg", "pipe:1",
+            ]
+        else:
+            cmd += [
+                "-vf", f"{crop}scale=1280:720",
+                "-c:v", "mjpeg", "-q:v", "5", "-f", "mjpeg", "pipe:1",
+            ]
+        return cmd
+
+    def _stop_ffmpeg(self) -> None:
+        self._pump_stop.set()
+        proc = self._ffmpeg
+        self._ffmpeg = None
+        if proc and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2)
 
     def _start_ffmpeg(self) -> None:
         if self._ffmpeg and self._ffmpeg.poll() is None:
             return
+        self._pump_stop.clear()
         self._ffmpeg = subprocess.Popen(
-            [
-                "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
-                "-f", "v4l2", "-input_format", "mjpeg",
-                "-video_size", "1280x720", "-framerate", "30",
-                "-i", str(self.camera.path),
-                "-c:v", "copy", "-f", "mjpeg", "pipe:1",
-            ],
+            self._build_ffmpeg_cmd(),
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=self._ffmpeg_log,
         )
         threading.Thread(target=self._pump, daemon=True).start()
+
+    def _restart_ffmpeg(self) -> None:
+        with self._lock:
+            self._clients.clear()
+        self._stop_ffmpeg()
+        self._start_ffmpeg()
+
+    def set_output_zoom(self, percent: int) -> dict:
+        self._zoom_pct = max(0, min(100, int(percent)))
+        self.camera.set_zoom(self._zoom_pct)
+        self._restart_ffmpeg()
+        return self.public_status()
 
     def _pump(self) -> None:
         soi, eoi = b"\xff\xd8", b"\xff\xd9"
         buf = b""
-        assert self._ffmpeg and self._ffmpeg.stdout
-        while self._ffmpeg.poll() is None:
-            chunk = self._ffmpeg.stdout.read(4096)
+        proc = self._ffmpeg
+        if not proc or not proc.stdout:
+            return
+        while not self._pump_stop.is_set() and proc.poll() is None:
+            chunk = proc.stdout.read(4096)
             if not chunk:
                 break
             buf += chunk
@@ -158,6 +262,14 @@ class PreviewServer:
             def log_message(self, fmt, *args):
                 return
 
+            def _json(self, payload: dict, code: int = 200) -> None:
+                body = json.dumps(payload).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
             def do_GET(self):
                 path = urlparse(self.path).path
                 if path == "/":
@@ -169,12 +281,7 @@ class PreviewServer:
                     self.wfile.write(body)
                     return
                 if path == "/api/status":
-                    body = json.dumps(server.camera.status(with_serial=True).as_dict()).encode()
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
+                    self._json(server.public_status())
                     return
                 if path == "/stream.mjpg":
                     server._start_ffmpeg()
@@ -196,17 +303,24 @@ class PreviewServer:
                 parsed = urlparse(self.path)
                 qs = parse_qs(parsed.query)
                 if parsed.path == "/api/track":
-                    mode = (qs.get("mode") or ["human"])[0]
+                    mode = (qs.get("mode") or ["upper"])[0]
                     if mode not in AI_MODES:
                         self.send_error(400, "bad mode")
                         return
-                    st = server.camera.set_ai(mode)
-                    body = json.dumps(st.as_dict()).encode()
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
+                    if mode in {"on", "upper", "upperbody", "waist", "thigh", "medium"}:
+                        server.camera.apply_subject_framing()
+                    else:
+                        server.camera.set_ai(mode)
+                    server._restart_ffmpeg()
+                    self._json(server.public_status())
+                    return
+                if parsed.path == "/api/zoom":
+                    try:
+                        pct = int((qs.get("pct") or ["0"])[0])
+                    except ValueError:
+                        self.send_error(400, "bad zoom")
+                        return
+                    self._json(server.set_output_zoom(pct))
                     return
                 if parsed.path == "/api/ptz":
                     direction = (qs.get("dir") or ["home"])[0]
@@ -223,27 +337,27 @@ class PreviewServer:
                     else:
                         self.send_error(400)
                         return
-                    body = json.dumps(server.camera.status().as_dict()).encode()
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
+                    self._json(server.public_status())
                     return
                 self.send_error(404)
 
         return Handler
 
     def serve(self) -> None:
-        print(f"Tiny 3 Lite UI  http://{self.host}:{self.port}/")
-        print(f"capture node    {self.camera.path}")
+        self.camera.apply_subject_framing()
+        self._start_ffmpeg()
+        print(f"Tiny 3 Lite UI     http://{self.host}:{self.port}/")
+        print(f"capture node       {self.camera.path}")
+        if self.loopback:
+            print(f"OBS virtual camera {self.loopback}  (Video Capture Device)")
+        else:
+            print("OBS virtual camera  not found — load v4l2loopback")
+        print("tracking           waist (thigh to eyebrows)")
         try:
             self.httpd.serve_forever()
         finally:
             self.close()
 
     def close(self) -> None:
-        if self._ffmpeg:
-            self._ffmpeg.terminate()
-            self._ffmpeg = None
+        self._stop_ffmpeg()
         self.httpd.server_close()

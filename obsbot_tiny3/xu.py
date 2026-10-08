@@ -42,6 +42,21 @@ class _Query(ctypes.Structure):
     ]
 
 
+def find_loopback_device() -> Path | None:
+    """v4l2loopback node OBS can capture (written by ffmpeg)."""
+    preferred = os.environ.get("OBSBOT_VIRTUAL")
+    if preferred and Path(preferred).exists():
+        return Path(preferred)
+    sysfs = Path("/sys/class/video4linux")
+    if not sysfs.exists():
+        return None
+    for name in sorted(p.name for p in sysfs.iterdir()):
+        card = (sysfs / name / "name").read_text(encoding="utf-8", errors="replace").strip().lower()
+        if "virtual" in card or "loopback" in card:
+            return Path("/dev") / name
+    return None
+
+
 def find_capture_device() -> Path:
     preferred = os.environ.get("OBSBOT_DEVICE")
     if preferred and Path(preferred).exists():
