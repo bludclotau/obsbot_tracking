@@ -9,7 +9,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from .camera import AI_MODES, Camera
+from .camera import (
+    AI_MODES,
+    FRAME_CROP_BOTTOM,
+    FRAME_CROP_TOP,
+    WAIST_MODES,
+    Camera,
+)
 from .xu import find_loopback_device
 
 HTML = """<!DOCTYPE html>
@@ -48,7 +54,7 @@ HTML = """<!DOCTYPE html>
     <h1>AI tracking</h1>
     <div class="status" id="status">loading…</div>
     <div class="grid" id="modes"></div>
-    <p class="hint">Track (waist) keeps knees/thigh to eyebrows so waist and face stay in frame. OBS uses the virtual camera.</p>
+    <p class="hint">Waist tracking follows the whole body, then crops so the frame just clips the top of the head and sits on the thighs. OBS uses the virtual camera.</p>
     <label class="zoom">Zoom <span id="zlab">1.0x</span></label>
     <input id="zoom" type="range" min="0" max="100" value="0" step="1">
     <h1 style="margin-top:20px">PTZ</h1>
@@ -68,8 +74,9 @@ HTML = """<!DOCTYPE html>
 <script>
 const modes = [
   ["off","Off"],
-  ["upper","Waist"],
+  ["waist","Waist"],
   ["human","Full body"],
+  ["upper","Upper"],
   ["closeup","Close-up"],
   ["group","Group"],
   ["hand","Hand"],
@@ -105,7 +112,11 @@ async function refresh() {
     " · zoom " + (s.zoom_x || "1.0") + "x" +
     (s.running ? " · run" : " · sleep") + vcam;
   document.querySelectorAll("#modes button").forEach(b => {
-    b.classList.toggle("active", b.dataset.mode === s.ai || (s.ai==="upper" && b.dataset.mode==="upper"));
+    const waist = s.framing === "crown-to-thigh";
+    b.classList.toggle("active",
+      (b.dataset.mode === "waist" && waist) ||
+      (b.dataset.mode === s.ai && !(waist && b.dataset.mode === "human"))
+    );
   });
   if (typeof s.zoom_pct === "number" && document.activeElement !== zoom) {
     zoom.value = s.zoom_pct;
@@ -136,6 +147,7 @@ class PreviewServer:
         self._clients: list = []
         self._lock = threading.Lock()
         self._zoom_pct = 0
+        self._subject_crop = True
         self._pump_stop = threading.Event()
         self._ffmpeg_log = open("/tmp/obsbot-tiny3-ffmpeg.log", "ab")
         handler = self._handler()
@@ -146,7 +158,7 @@ class PreviewServer:
         st["zoom_pct"] = self._zoom_pct
         st["zoom_x"] = round(1 + 3 * self._zoom_pct / 100, 2)
         st["virtual_camera"] = str(self.loopback) if self.loopback else None
-        st["framing"] = "thigh-to-eyebrow" if st["ai"] == "upper" else st["ai"]
+        st["framing"] = "crown-to-thigh" if self._subject_crop else st["ai"]
         return st
 
     def _ffmpeg_zoom(self) -> float:
@@ -155,9 +167,23 @@ class PreviewServer:
             return 1.0
         return 1.0 + 3.0 * (self._zoom_pct / 100.0)
 
-    def _build_ffmpeg_cmd(self) -> list[str]:
+    def _vf(self, width: int, height: int, pix_fmt: str | None = None) -> str:
+        parts: list[str] = []
+        if self._subject_crop:
+            keep = 1.0 - FRAME_CROP_TOP - FRAME_CROP_BOTTOM
+            parts.append(
+                f"crop=trunc(iw*{keep:.4f}/2)*2:trunc(ih*{keep:.4f}/2)*2:"
+                f"(iw-ow)/2:trunc(ih*{FRAME_CROP_TOP:.4f}/2)*2"
+            )
         z = self._ffmpeg_zoom()
-        crop = f"crop=iw/{z:.4f}:ih/{z:.4f}," if z > 1.02 else ""
+        if z > 1.02:
+            parts.append(f"crop=trunc(iw/{z:.4f}/2)*2:trunc(ih/{z:.4f}/2)*2")
+        parts.append(f"scale={width}:{height}")
+        if pix_fmt:
+            parts.append(f"format={pix_fmt}")
+        return ",".join(parts)
+
+    def _build_ffmpeg_cmd(self) -> list[str]:
         cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
             "-fflags", "nobuffer", "-flags", "low_delay",
@@ -166,17 +192,17 @@ class PreviewServer:
             "-i", str(self.camera.path),
         ]
         if self.loopback:
+            obs = self._vf(1920, 1080, "yuv420p")
+            web = self._vf(1280, 720)
             cmd += [
                 "-filter_complex",
-                f"[0:v]split=2[v1][v2];"
-                f"[v1]{crop}scale=1920:1080,format=yuv420p[obs];"
-                f"[v2]{crop}scale=1280:720[web]",
+                f"[0:v]split=2[v1][v2];[v1]{obs}[obs];[v2]{web}[web]",
                 "-map", "[obs]", "-f", "v4l2", "-pix_fmt", "yuv420p", str(self.loopback),
                 "-map", "[web]", "-c:v", "mjpeg", "-q:v", "5", "-f", "mjpeg", "pipe:1",
             ]
         else:
             cmd += [
-                "-vf", f"{crop}scale=1280:720",
+                "-vf", self._vf(1280, 720),
                 "-c:v", "mjpeg", "-q:v", "5", "-f", "mjpeg", "pipe:1",
             ]
         return cmd
@@ -303,13 +329,15 @@ class PreviewServer:
                 parsed = urlparse(self.path)
                 qs = parse_qs(parsed.query)
                 if parsed.path == "/api/track":
-                    mode = (qs.get("mode") or ["upper"])[0]
+                    mode = (qs.get("mode") or ["waist"])[0]
                     if mode not in AI_MODES:
                         self.send_error(400, "bad mode")
                         return
-                    if mode in {"on", "upper", "upperbody", "waist", "thigh", "medium"}:
+                    if mode in WAIST_MODES:
+                        server._subject_crop = True
                         server.camera.apply_subject_framing()
                     else:
+                        server._subject_crop = False
                         server.camera.set_ai(mode)
                     server._restart_ffmpeg()
                     self._json(server.public_status())
@@ -352,7 +380,7 @@ class PreviewServer:
             print(f"OBS virtual camera {self.loopback}  (Video Capture Device)")
         else:
             print("OBS virtual camera  not found — load v4l2loopback")
-        print("tracking           waist (thigh to eyebrows)")
+        print("tracking           waist (clip crown, thighs at bottom)")
         try:
             self.httpd.serve_forever()
         finally:

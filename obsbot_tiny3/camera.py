@@ -19,6 +19,13 @@ FLAGS_SET = 0x25
 CMD_ZOOM_ABS = 0x1942
 RX_CAMERA = 0x02
 
+# Output crop on a full-body tracked frame (fractions of source height).
+# Top of the 16:9 window clips the crown; bottom sits on the thighs.
+FRAME_CROP_TOP = 0.16
+FRAME_CROP_BOTTOM = 0.14
+
+WAIST_MODES = frozenset({"on", "waist", "thigh", "medium"})
+
 AI_MODES = {
     "off": (0, 0),
     "stop": (0, 0),
@@ -28,10 +35,10 @@ AI_MODES = {
     "normal": (2, 0),
     "upper": (2, 1),
     "upperbody": (2, 1),
-    "on": (2, 1),
-    "waist": (2, 1),
-    "thigh": (2, 1),
-    "medium": (2, 1),
+    "on": (2, 0),
+    "waist": (2, 0),
+    "thigh": (2, 0),
+    "medium": (2, 0),
     "closeup": (2, 2),
     "headless": (2, 3),
     "lower": (2, 4),
@@ -223,14 +230,14 @@ class Camera:
         return self.status()
 
     def apply_subject_framing(self) -> Status:
-        """Lock on-camera AI to a thigh-to-eyebrow shot (waist and face in frame)."""
+        """Full-body AI so thighs stay in the sensor frame; output crop clips the crown."""
         st = self.status()
         if st.ai != "off" or st.zoom_pct > 2 or st.fov != 0:
             self.set_ai("off")
             self.set_zoom_ratio(ZOOM_RATIO_MIN, speed=10)
             self.set_fov(0)
             time.sleep(0.2)
-        self.set_ai("upper")
+        self.set_ai("human")
         self.set_fov(0)
         return self.status()
 
