@@ -19,15 +19,20 @@ FLAGS_SET = 0x25
 CMD_ZOOM_ABS = 0x1942
 CMD_GIM_SPEED = 0x6484
 CMD_GIM_STATE = 0x6604
+CMD_DEV_STATUS = 0xA0C2
 RX_CAMERA = 0x02
 RX_AI = 0x04
 
-# Tilt down from the tracker lock so the waist sits in the middle of the
-# frame and the top of the head meets the top of the frame. Degrees.
-WAIST_TILT_DOWN_DEG = 15.0
+# Tilt helpers for the PTZ pad. Positive pitch is down.
 MAX_PITCH_DOWN_DEG = 40.0
 
-WAIST_MODES = frozenset({"on", "waist", "thigh", "medium"})
+# Normalized frame coords: x right, y down. Belly / hips of a person
+# standing in a cowboy shot sit around the lower-center of the frame.
+HIPS_X = 0.50
+HIPS_Y = 0.62
+HIPS_BOX = (0.38, 0.50, 0.62, 0.80)
+
+WAIST_MODES = frozenset({"on", "waist", "thigh", "medium", "object"})
 
 AI_MODES = {
     "off": (0, 0),
@@ -38,10 +43,11 @@ AI_MODES = {
     "normal": (2, 0),
     "upper": (2, 1),
     "upperbody": (2, 1),
-    "on": (2, 0),
-    "waist": (2, 0),
-    "thigh": (2, 0),
-    "medium": (2, 0),
+    "on": (7, 2),
+    "waist": (7, 2),
+    "thigh": (7, 2),
+    "medium": (7, 2),
+    "object": (7, 2),
     "closeup": (2, 2),
     "headless": (2, 3),
     "lower": (2, 4),
@@ -62,6 +68,10 @@ AI_NAMES = {
     (3, 0): "hand",
     (4, 0): "whiteboard",
     (5, 0): "desk",
+    (7, 0): "object",
+    (7, 1): "object",
+    (7, 2): "object",
+    (7, 3): "object",
 }
 
 
@@ -115,13 +125,25 @@ def crc16_usb(data: bytes) -> int:
     return crc ^ 0xFFFF
 
 
-def build_frame(flags: int, seq: int, cmd: int, receiver: int, payload: bytes = b"") -> bytes:
+def pack_v3_cmd(cmd_id: int, cmd_set: int) -> int:
+    """V3 wire command: cmd_set in low 6 bits, cmd_id in the high 10."""
+    return (cmd_set & 0x3F) | ((cmd_id & 0x3FF) << 6)
+
+
+def build_frame(
+    flags: int,
+    seq: int,
+    cmd: int,
+    receiver: int,
+    payload: bytes = b"",
+    sender: int = 0x0A,
+) -> bytes:
     frame = bytearray(60)
     frame[0] = 0xAA
     frame[1] = flags
     struct.pack_into("<H", frame, 2, seq)
     struct.pack_into("<H", frame, 4, 12)
-    frame[8] = 0x0A
+    frame[8] = sender
     frame[9] = receiver
     struct.pack_into("<H", frame, 10, cmd)
     struct.pack_into("<H", frame, 6, crc16_usb(bytes(frame[0:12])))
@@ -138,7 +160,6 @@ class Camera:
     def __init__(self, path: Path | str | None = None):
         self.dev = XuDevice(Path(path) if path else None)
         self._seq = 1
-        self.waist_pitch_target: float | None = None
 
     @property
     def path(self) -> Path:
@@ -163,10 +184,18 @@ class Camera:
         if key not in AI_MODES:
             raise ValueError(f"unknown AI mode {mode!r}; choose from {sorted(set(AI_MODES))}")
         m, n = AI_MODES[key]
+        if key not in {"off", "stop", "none"}:
+            self.wake()
         self.dev.send_status_cmd(bytes([xu.TAG_AI_MODE, 0x02, m, n]))
         time.sleep(0.4)
         st = self.status()
-        if st.ai.startswith("unknown"):
+        if st.ai.startswith("unknown") and (m, n) not in AI_NAMES:
+            time.sleep(0.4)
+            st = self.status()
+        # Tiny 3 Lite object-tracking 2.0 can reject legacy human (2,x).
+        # Group still follows people, so Full body keeps tracking.
+        if key in {"human", "normal", "upper", "upperbody"} and st.ai in {"off", "none", "stop"}:
+            self.dev.send_status_cmd(bytes([xu.TAG_AI_MODE, 0x02, 1, 0]))
             time.sleep(0.4)
             st = self.status()
         return st
@@ -179,10 +208,17 @@ class Camera:
             raise ValueError("fov must be 0=wide 1=medium 2=narrow")
         self.dev.send_status_cmd(bytes([xu.TAG_FOV, 0x01, mode]))
 
-    def send_frame(self, flags: int, cmd: int, receiver: int, payload: bytes = b"") -> bytes:
+    def send_frame(
+        self,
+        flags: int,
+        cmd: int,
+        receiver: int,
+        payload: bytes = b"",
+        sender: int = 0x0A,
+    ) -> bytes:
         seq = self._seq
         self._seq = (self._seq + 1) & 0xFFFF
-        frame = build_frame(flags, seq, cmd, receiver, payload)
+        frame = build_frame(flags, seq, cmd, receiver, payload, sender=sender)
         with self.dev._lock:
             self.dev.set_block(frame, xu.XU_SEL_FRAME)
             time.sleep(0.1)
@@ -242,12 +278,62 @@ class Camera:
         self.gimbal_stop()
         return self.gimbal_pitch_deg()
 
-    def hold_waist_pitch(self, target_deg: float) -> None:
-        """If the tracker has pulled the frame back up, tilt down again."""
-        pitch = self.gimbal_pitch_deg()
-        if pitch is None or pitch >= target_deg - 1.5:
+    def _try_frame(self, cmd: int, receiver: int, payload: bytes, sender: int = 0x0B) -> None:
+        try:
+            self.send_frame(FLAGS_SET, cmd, receiver, payload, sender=sender)
+        except OSError:
+            pass
+
+    def select_hips(self) -> None:
+        """Ask the on-camera tracker to lock the belly / hips.
+
+        Tiny 3 Lite object tracking (AI 7,2) follows a tapped or boxed
+        object. Center auto-selects that region as the target: a click at
+        the bellybutton and a box around the hips. Several SDK encodings
+        are sent because this model does not ACK the select mailbox.
+        """
+        pos = struct.pack("<ff", HIPS_X, HIPS_Y)
+        box = struct.pack("<ffff", *HIPS_BOX)
+        click = struct.pack("<hhhhff", 2, 0, 0, 5, HIPS_X, HIPS_Y) + bytes(8)
+        roi = struct.pack("<hhhhffff", 3, 2, 0, 0, *HIPS_BOX)
+        try:
+            self.dev.send_status_cmd(bytes([xu.TAG_AI_MODE, 0x12, 7, 2]) + box)
+        except OSError:
+            pass
+        # SDK select-by-pos/box/biggest/unified-target. Tiny 3 Lite often
+        # does not ACK these; send both cmd-set 3 (gimbal) and 4 (AI).
+        shots = (
+            (0x63, 3, 0x03, pos),
+            (0x63, 4, 0x04, pos + bytes([0])),
+            (0x64, 3, 0x03, box),
+            (0x64, 4, 0x04, box),
+            (0x65, 3, 0x03, bytes([0])),
+            (0x66, 3, 0x03, b""),
+            (0x7A, 3, 0x03, click),
+            (0x7A, 3, 0x03, roi),
+        )
+        for cmd_id, cmd_set, rx, payload in shots:
+            self._try_frame(pack_v3_cmd(cmd_id, cmd_set), rx, payload)
+
+    def wake(self) -> None:
+        """Leave auto-sleep / privacy pose so tracking commands are accepted."""
+        try:
+            self.send_frame(FLAGS_SET, CMD_DEV_STATUS, RX_CAMERA, struct.pack("<I", 0))
+        except OSError:
             return
-        self.tilt_to_pitch(target_deg, speed_dps=14.0)
+        for _ in range(12):
+            time.sleep(0.15)
+            st = self.status()
+            if st.running:
+                time.sleep(0.25)
+                return
+
+    def apply_subject_framing(self) -> Status:
+        """Object tracking locked on the belly / hips. No gimbal hold loop."""
+        self.set_ai("object")
+        time.sleep(0.25)
+        self.select_hips()
+        return self.status()
 
     def recenter(self) -> None:
         self.gimbal_stop()
@@ -284,18 +370,6 @@ class Camera:
                 return st
             if abs(st.zoom_pct - target_pct) <= 3:
                 return st
-        return self.status()
-
-    def apply_subject_framing(self) -> Status:
-        """Human tracking, dynamic zoom, gimbal tilted down so the waist is centered."""
-        self.set_ai("human")
-        time.sleep(0.45)
-        start = self.gimbal_pitch_deg()
-        if start is None:
-            self.waist_pitch_target = None
-            return self.status()
-        self.waist_pitch_target = min(start + WAIST_TILT_DOWN_DEG, MAX_PITCH_DOWN_DEG)
-        self.tilt_to_pitch(self.waist_pitch_target)
         return self.status()
 
     def _v4l(self, ctrls: str) -> None:

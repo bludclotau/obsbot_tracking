@@ -45,7 +45,7 @@ The app writes 1080p30 into the loopback device. OBS must not open the real Tiny
 
 ```bash
 obsbot-tiny3 status
-obsbot-tiny3 track on          # waist shot: thighs to eyebrows
+obsbot-tiny3 track on          # object tracking locked on belly / hips
 obsbot-tiny3 track off
 obsbot-tiny3 zoom 0            # 1.0x  (100 = 4.0x)
 obsbot-tiny3 home
@@ -53,7 +53,7 @@ obsbot-tiny3 nudge left
 obsbot-tiny3 ui                # preview + virtual camera
 ```
 
-`track on` / `track waist` uses **human tracking** with the camera’s dynamic zoom. After lock, the gimbal tilts down ~15° so the **waist stays in the center** and the **top of the head meets the top of the frame**. A hold loop keeps that pitch if the tracker pulls back up.
+`track on` / `track waist` turns on Tiny 3 Lite **object tracking** (AI mode 7,2) and auto-selects the **belly / hips** as the tracked object (tap at mid-frame, slightly below center, plus a hips bounding box). The gimbal is left to that tracker. A previous hold-loop that tilted down against face/upper-body tracking is gone — that fight was the pause, dip, and snap-back.
 
 ## Zoom
 
@@ -88,6 +88,9 @@ AI command: `[0x16, 0x02, mode, submode]`.
 | 3, 0 | hand |
 | 4, 0 | whiteboard |
 | 5, 0 | desk |
+| 7, 2 | object (Tiny 3 Lite AI Tracking 2.0) |
+
+Waist mode sends the object-tracking select-target packets (click / box / biggest / center) at the bellybutton. Tiny 3 Lite often does not ACK those frames; they are still the SDK tap-to-track commands.
 
 Zoom frame: command `0x1942`, payload `[speed u32][ratio×100 u32]` with ratio 100–400.
 
