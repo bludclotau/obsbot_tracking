@@ -13,6 +13,7 @@ from __future__ import annotations
 import ctypes
 import fcntl
 import os
+import threading
 from pathlib import Path
 
 UVCIOC_CTRL_QUERY = 0xC0107521
@@ -83,6 +84,7 @@ class XuDevice:
     def __init__(self, path: Path | str | None = None):
         self.path = Path(path) if path else find_capture_device()
         self.fd = os.open(self.path, os.O_RDWR)
+        self._lock = threading.RLock()
 
     def close(self) -> None:
         if getattr(self, "fd", -1) >= 0:
@@ -97,7 +99,8 @@ class XuDevice:
 
     def _ioctl(self, selector: int, query: int, buf: ctypes.Array) -> None:
         q = _Query(XU_UNIT, selector, query, len(buf), ctypes.addressof(buf))
-        fcntl.ioctl(self.fd, UVCIOC_CTRL_QUERY, q)
+        with self._lock:
+            fcntl.ioctl(self.fd, UVCIOC_CTRL_QUERY, q)
 
     def get_len(self, selector: int) -> int:
         buf = (ctypes.c_uint8 * 2)()

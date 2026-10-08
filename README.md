@@ -53,7 +53,7 @@ obsbot-tiny3 nudge left
 obsbot-tiny3 ui                # preview + virtual camera
 ```
 
-`track on` / `track waist` uses full-body AI so the gimbal keeps the legs, then crops the virtual-camera feed to a cowboy shot: **top of the head just clipped, bottom on the thighs**. Close-up and uncropped full-body remain available if you ask for them.
+`track on` / `track waist` uses **human tracking** with the camera’s dynamic zoom. After lock, the gimbal tilts down ~15° so the **waist stays in the center** and the **top of the head meets the top of the frame**. A hold loop keeps that pitch if the tracker pulls back up.
 
 ## Zoom
 

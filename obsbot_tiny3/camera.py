@@ -17,12 +17,15 @@ ZOOM_RATIO_MIN = 100
 ZOOM_RATIO_MAX = 400
 FLAGS_SET = 0x25
 CMD_ZOOM_ABS = 0x1942
+CMD_GIM_SPEED = 0x6484
+CMD_GIM_STATE = 0x6604
 RX_CAMERA = 0x02
+RX_AI = 0x04
 
-# Output crop on a full-body tracked frame (fractions of source height).
-# Top of the 16:9 window clips the crown; bottom sits on the thighs.
-FRAME_CROP_TOP = 0.16
-FRAME_CROP_BOTTOM = 0.14
+# Tilt down from the tracker lock so the waist sits in the middle of the
+# frame and the top of the head meets the top of the frame. Degrees.
+WAIST_TILT_DOWN_DEG = 15.0
+MAX_PITCH_DOWN_DEG = 40.0
 
 WAIST_MODES = frozenset({"on", "waist", "thigh", "medium"})
 
@@ -135,6 +138,7 @@ class Camera:
     def __init__(self, path: Path | str | None = None):
         self.dev = XuDevice(Path(path) if path else None)
         self._seq = 1
+        self.waist_pitch_target: float | None = None
 
     @property
     def path(self) -> Path:
@@ -179,9 +183,10 @@ class Camera:
         seq = self._seq
         self._seq = (self._seq + 1) & 0xFFFF
         frame = build_frame(flags, seq, cmd, receiver, payload)
-        self.dev.set_block(frame, xu.XU_SEL_FRAME)
-        time.sleep(0.08)
-        return bytes(self.dev.get_block(xu.XU_SEL_FRAME))
+        with self.dev._lock:
+            self.dev.set_block(frame, xu.XU_SEL_FRAME)
+            time.sleep(0.1)
+            return bytes(self.dev.get_block(xu.XU_SEL_FRAME))
 
     def serial(self) -> str | None:
         try:
@@ -193,7 +198,59 @@ class Camera:
         except OSError:
             return None
 
+    def gimbal_speed(self, yaw_dps: float, pitch_dps: float) -> None:
+        """Yaw right / pitch down are positive (Tiny 2 framed protocol)."""
+        payload = bytearray(12)
+        struct.pack_into("<f", payload, 4, float(pitch_dps))
+        struct.pack_into("<f", payload, 8, float(yaw_dps))
+        self.send_frame(FLAGS_SET, CMD_GIM_SPEED, RX_AI, bytes(payload))
+
+    def gimbal_stop(self) -> None:
+        self.gimbal_speed(0.0, 0.0)
+
+    def gimbal_pitch_deg(self) -> float | None:
+        """Current pitch in degrees. Positive is down."""
+        rep = self.send_frame(0x01, CMD_GIM_STATE, RX_AI, b"")
+        if rep[0] != 0xAA:
+            return None
+        cmd = int.from_bytes(rep[10:12], "little")
+        if cmd != CMD_GIM_STATE:
+            return None
+        return struct.unpack_from("<h", rep, 18)[0] / 10.0
+
+    def tilt_to_pitch(self, target_deg: float, speed_dps: float = 18.0) -> float | None:
+        pitch = self.gimbal_pitch_deg()
+        if pitch is None:
+            return None
+        target = max(-MAX_PITCH_DOWN_DEG, min(MAX_PITCH_DOWN_DEG, target_deg))
+        delta = target - pitch
+        if abs(delta) < 1.0:
+            return pitch
+        direction = speed_dps if delta > 0 else -speed_dps
+        self.gimbal_speed(0.0, direction)
+        limit = min(1.6, abs(delta) / max(speed_dps, 1.0) + 0.25)
+        t0 = time.time()
+        while time.time() - t0 < limit:
+            time.sleep(0.05)
+            pitch = self.gimbal_pitch_deg()
+            if pitch is None:
+                continue
+            if direction > 0 and pitch >= target:
+                break
+            if direction < 0 and pitch <= target:
+                break
+        self.gimbal_stop()
+        return self.gimbal_pitch_deg()
+
+    def hold_waist_pitch(self, target_deg: float) -> None:
+        """If the tracker has pulled the frame back up, tilt down again."""
+        pitch = self.gimbal_pitch_deg()
+        if pitch is None or pitch >= target_deg - 1.5:
+            return
+        self.tilt_to_pitch(target_deg, speed_dps=14.0)
+
     def recenter(self) -> None:
+        self.gimbal_stop()
         self.send_frame(0x25, 0x00C3, 0x03, bytes(6))
         self._v4l("pan_absolute=0,tilt_absolute=0")
 
@@ -230,15 +287,15 @@ class Camera:
         return self.status()
 
     def apply_subject_framing(self) -> Status:
-        """Full-body AI so thighs stay in the sensor frame; output crop clips the crown."""
-        st = self.status()
-        if st.ai != "off" or st.zoom_pct > 2 or st.fov != 0:
-            self.set_ai("off")
-            self.set_zoom_ratio(ZOOM_RATIO_MIN, speed=10)
-            self.set_fov(0)
-            time.sleep(0.2)
+        """Human tracking, dynamic zoom, gimbal tilted down so the waist is centered."""
         self.set_ai("human")
-        self.set_fov(0)
+        time.sleep(0.45)
+        start = self.gimbal_pitch_deg()
+        if start is None:
+            self.waist_pitch_target = None
+            return self.status()
+        self.waist_pitch_target = min(start + WAIST_TILT_DOWN_DEG, MAX_PITCH_DOWN_DEG)
+        self.tilt_to_pitch(self.waist_pitch_target)
         return self.status()
 
     def _v4l(self, ctrls: str) -> None:
