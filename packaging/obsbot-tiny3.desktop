@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=OBSBOT Tiny 3 Lite
+Comment=Live preview and on-camera AI tracking
+Exec=obsbot-tiny3 ui
+Icon=camera-web
+Terminal=false
+Type=Application
+Categories=AudioVideo;Video;
+StartupNotify=true

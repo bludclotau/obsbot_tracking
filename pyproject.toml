@@ -1,0 +1,18 @@
+[project]
+name = "obsbot-tiny3"
+version = "0.1.0"
+description = "Linux controller for OBSBOT Tiny 3 Lite: on-camera AI tracking, PTZ, live preview. No vendor SDK."
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "bludclotau"}]
+
+[project.scripts]
+obsbot-tiny3 = "obsbot_tiny3.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["obsbot_tiny3*"]
