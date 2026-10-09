@@ -40,6 +40,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "track":
             if args.mode in FULL_BODY_MODES:
                 st = cam.apply_full_body()
+            elif args.mode in {"human", "normal", "upper", "upperbody", "closeup"}:
+                cam.set_ai(args.mode)
+                cam.set_auto_zoom(True)
+                st = cam.status()
             else:
                 st = cam.set_ai(args.mode)
             print(json.dumps(st.as_dict(), indent=2))

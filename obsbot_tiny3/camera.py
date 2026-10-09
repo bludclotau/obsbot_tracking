@@ -20,14 +20,15 @@ CMD_ZOOM_ABS = 0x1942
 CMD_GIM_SPEED = 0x6484
 CMD_GIM_STATE = 0x6604
 CMD_DEV_STATUS = 0xA0C2
+CMD_AUTO_ZOOM = 0x5A
 RX_CAMERA = 0x02
 RX_AI = 0x04
 
 # Tilt helpers for the PTZ pad. Positive pitch is down.
 MAX_PITCH_DOWN_DEG = 40.0
 
-# CLI/UI aliases that mean "follow a person, full body".
-FULL_BODY_MODES = frozenset({"on", "waist", "thigh", "medium", "human", "normal"})
+# CLI/UI aliases that mean person tracking with lower-body / auto-zoom framing.
+FULL_BODY_MODES = frozenset({"on", "waist", "thigh", "medium", "lower", "lowerbody"})
 WAIST_MODES = FULL_BODY_MODES  # old name, kept for imports
 
 AI_MODES = {
@@ -39,10 +40,10 @@ AI_MODES = {
     "normal": (2, 0),
     "upper": (2, 1),
     "upperbody": (2, 1),
-    "on": (2, 0),
-    "waist": (2, 0),
-    "thigh": (2, 0),
-    "medium": (2, 0),
+    "on": (2, 4),
+    "waist": (2, 4),
+    "thigh": (2, 4),
+    "medium": (2, 4),
     "object": (7, 2),
     "closeup": (2, 2),
     "headless": (2, 3),
@@ -186,9 +187,8 @@ class Camera:
         if st.ai.startswith("unknown") and (m, n) not in AI_NAMES:
             time.sleep(0.4)
             st = self.status()
-        # Tiny 3 Lite often rejects single-person human (2,x) after object
-        # mode has been used. Group tracking still follows a person.
-        if key in FULL_BODY_MODES | {"upper", "upperbody"} and st.ai in {"off", "none", "stop"}:
+        # Human/upper can be rejected; group still follows a person.
+        if key in {"human", "normal", "upper", "upperbody"} and st.ai in {"off", "none", "stop"}:
             self.dev.send_status_cmd(bytes([xu.TAG_AI_MODE, 0x02, 1, 0]))
             time.sleep(0.45)
             st = self.status()
@@ -285,9 +285,25 @@ class Camera:
                 time.sleep(0.25)
                 return
 
+    def set_auto_zoom(self, enabled: bool = True) -> None:
+        """Turn on the camera's AI auto-zoom (dynamic zoom)."""
+        payload = bytes([1 if enabled else 0])
+        for cmd_set, rx in ((4, RX_AI), (3, 0x03), (4, 0x03), (3, RX_AI)):
+            cmd = (cmd_set & 0x3F) | ((CMD_AUTO_ZOOM & 0x3FF) << 6)
+            try:
+                self.send_frame(FLAGS_SET, cmd, rx, payload, sender=0x0B)
+            except OSError:
+                pass
+
     def apply_full_body(self) -> Status:
-        """Person tracking, full body. Leaves framing to the camera; crop in OBS."""
-        return self.set_ai("human")
+        """Person tracking biased to the lower body, with dynamic zoom."""
+        st = self.set_ai("lower")
+        if st.ai != "lower":
+            st = self.set_ai("human")
+        if st.ai in {"off", "none", "stop"}:
+            st = self.set_ai("group")
+        self.set_auto_zoom(True)
+        return self.status()
 
     def apply_subject_framing(self) -> Status:
         return self.apply_full_body()

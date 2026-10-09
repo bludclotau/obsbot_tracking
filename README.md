@@ -45,7 +45,7 @@ The app writes 1080p30 into the loopback device. OBS must not open the real Tiny
 
 ```bash
 obsbot-tiny3 status
-obsbot-tiny3 track on          # full-body person tracking
+obsbot-tiny3 track on          # lower-body person tracking + dynamic zoom
 obsbot-tiny3 track off
 obsbot-tiny3 zoom 0            # 1.0x  (100 = 4.0x)
 obsbot-tiny3 home
@@ -53,7 +53,7 @@ obsbot-tiny3 nudge left
 obsbot-tiny3 ui                # preview + virtual camera
 ```
 
-`track on` / `track human` enables **full-body person tracking**. The virtual camera is an uncropped 1080p feed for OBS; crop there if you want a tighter shot. If single-person human mode (2,0) is rejected, the controller uses group tracking (1,0), which still follows a person.
+`track on` enables **lower-body person tracking** (AI 2,4) with **dynamic zoom**. The camera frames toward the waist and legs and auto-zooms as you move. The virtual camera is that 1080p feed for OBS. `track human` is full-body auto-zoom. If lower-body mode is rejected, the controller falls back to human, then group.
 
 ## Zoom
 

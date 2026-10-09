@@ -49,7 +49,7 @@ HTML = """<!DOCTYPE html>
     <h1>AI tracking</h1>
     <div class="status" id="status">loading…</div>
     <div class="grid" id="modes"></div>
-    <p class="hint">Full body: on-camera person tracking. OBS gets an uncropped 1080p virtual camera — crop there if you want a tighter shot.</p>
+    <p class="hint">Lower body: person tracking with dynamic zoom, framed toward the waist and legs. OBS gets that 1080p feed on the virtual camera.</p>
     <label class="zoom">Zoom <span id="zlab">1.0x</span></label>
     <input id="zoom" type="range" min="0" max="100" value="0" step="1">
     <h1 style="margin-top:20px">PTZ</h1>
@@ -69,6 +69,7 @@ HTML = """<!DOCTYPE html>
 <script>
 const modes = [
   ["off","Off"],
+  ["lower","Lower body"],
   ["human","Full body"],
   ["upper","Upper"],
   ["closeup","Close-up"],
@@ -106,10 +107,11 @@ async function refresh() {
     " · zoom " + (s.zoom_x || "1.0") + "x" +
     (s.running ? " · run" : " · sleep") + vcam;
   document.querySelectorAll("#modes button").forEach(b => {
-    const full = s.framing === "full-body";
+    const lower = s.framing === "lower-body";
     let on = b.dataset.mode === s.ai;
-    if (b.dataset.mode === "human") on = full || s.ai === "human";
-    else if (b.dataset.mode === "group") on = s.ai === "group" && !full;
+    if (b.dataset.mode === "lower") on = lower || s.ai === "lower";
+    else if (b.dataset.mode === "human") on = s.ai === "human" && !lower;
+    else if (b.dataset.mode === "group") on = s.ai === "group" && !lower;
     b.classList.toggle("active", on);
   });
   if (typeof s.zoom_pct === "number" && document.activeElement !== zoom) {
@@ -141,8 +143,9 @@ class PreviewServer:
         self._clients: list = []
         self._lock = threading.Lock()
         self._zoom_pct = 0
-        self._full_body = False
+        self._person_mode: str | None = None
         self._pump_stop = threading.Event()
+        self._keep_started = False
         self._ffmpeg_log = open("/tmp/obsbot-tiny3-ffmpeg.log", "ab")
         handler = self._handler()
         self.httpd = ThreadingHTTPServer((host, port), handler)
@@ -154,7 +157,10 @@ class PreviewServer:
         st["virtual_camera"] = str(self.loopback) if self.loopback else None
         pitch = self.camera.gimbal_pitch_deg()
         st["pitch_deg"] = round(pitch, 1) if pitch is not None else None
-        st["framing"] = "full-body" if self._full_body else st["ai"]
+        if self._person_mode in FULL_BODY_MODES:
+            st["framing"] = "lower-body"
+        else:
+            st["framing"] = st["ai"]
         return st
 
     def _ffmpeg_zoom(self) -> float:
@@ -173,22 +179,28 @@ class PreviewServer:
             parts.append(f"format={pix_fmt}")
         return ",".join(parts)
 
-    def _set_full_body(self, on: bool) -> None:
-        was = self._full_body
-        self._full_body = on
-        if on and not was:
+    def _set_person_mode(self, mode: str | None) -> None:
+        self._person_mode = mode
+        if mode and not self._keep_started:
+            self._keep_started = True
             threading.Thread(target=self._keep_tracking, daemon=True).start()
 
     def _keep_tracking(self) -> None:
         """Re-enable person tracking if the camera drops to off."""
-        while self._full_body:
+        while True:
             time.sleep(4.0)
-            if not self._full_body:
-                return
+            mode = self._person_mode
+            if not mode:
+                continue
             try:
                 st = self.camera.status()
-                if st.ai in {"off", "none", "stop"}:
+                if st.ai not in {"off", "none", "stop"}:
+                    continue
+                if mode in FULL_BODY_MODES:
                     self.camera.apply_full_body()
+                else:
+                    self.camera.set_ai(mode)
+                    self.camera.set_auto_zoom(True)
             except OSError:
                 pass
 
@@ -338,15 +350,19 @@ class PreviewServer:
                 parsed = urlparse(self.path)
                 qs = parse_qs(parsed.query)
                 if parsed.path == "/api/track":
-                    mode = (qs.get("mode") or ["human"])[0]
+                    mode = (qs.get("mode") or ["lower"])[0]
                     if mode not in AI_MODES:
                         self.send_error(400, "bad mode")
                         return
                     if mode in FULL_BODY_MODES:
                         server.camera.apply_full_body()
-                        server._set_full_body(True)
+                        server._set_person_mode("lower")
+                    elif mode in {"human", "normal", "upper", "upperbody", "closeup"}:
+                        server.camera.set_ai(mode)
+                        server.camera.set_auto_zoom(True)
+                        server._set_person_mode(mode)
                     else:
-                        server._set_full_body(False)
+                        server._set_person_mode(None)
                         server.camera.set_ai(mode)
                     server._restart_ffmpeg()
                     self._json(server.public_status())
@@ -382,7 +398,7 @@ class PreviewServer:
 
     def serve(self) -> None:
         self.camera.apply_full_body()
-        self._set_full_body(True)
+        self._set_person_mode("lower")
         self._start_ffmpeg()
         print(f"Tiny 3 Lite UI     http://{self.host}:{self.port}/")
         print(f"capture node       {self.camera.path}")
@@ -390,13 +406,13 @@ class PreviewServer:
             print(f"OBS virtual camera {self.loopback}  (Video Capture Device)")
         else:
             print("OBS virtual camera  not found — load v4l2loopback")
-        print("tracking           full body person tracking")
+        print("tracking           lower-body person tracking, dynamic zoom")
         try:
             self.httpd.serve_forever()
         finally:
             self.close()
 
     def close(self) -> None:
-        self._set_full_body(False)
+        self._set_person_mode(None)
         self._stop_ffmpeg()
         self.httpd.server_close()
